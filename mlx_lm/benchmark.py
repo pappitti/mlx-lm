@@ -4,13 +4,9 @@ import argparse
 
 import mlx.core as mx
 
-from mlx_lm import batch_generate, stream_generate
+from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.tokenizer_utils import load_tokenizer
-from mlx_lm.utils import (
-    fetch_from_hub,
-    get_model_path,
-)
+from mlx_lm.utils import pipeline_load
 
 
 def setup_arg_parser():
@@ -24,11 +20,6 @@ def setup_arg_parser():
             f"If no model is specified, then {DEFAULT_MODEL} is used."
         ),
         default=None,
-    )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Enable trusting remote code for tokenizer",
     )
     parser.add_argument(
         "--prompt-tokens",
@@ -66,22 +57,30 @@ def main():
     args = parser.parse_args()
     mx.random.seed(0)
 
+    group = mx.distributed.init()
+    rank = group.rank()
+
+    def rprint(*args, **kwargs):
+        if rank == 0:
+            print(*args, **kwargs)
+
     model_path = args.model or DEFAULT_MODEL
 
-    model_path, _ = get_model_path(model_path, revision=None)
-    model, config, _ = fetch_from_hub(model_path, trust_remote_code=True)
-    tokenizer = load_tokenizer(
-        model_path,
-        eos_token_ids=[],  # Empty to avoid early stopping
-        tokenizer_config_extra={"trust_remote_code": True},
-    )
+    if group.size() > 1:
+        model, tokenizer, config = pipeline_load(args.model, return_config=True)
+    else:
+        model, tokenizer, config = load(
+            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+        )
+
+    # Empty to avoid early stopping
+    tokenizer._eos_token_ids = {}
 
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    prompts = mx.random.randint(
-        0, config["vocab_size"], (batch_size, prompt_tokens)
-    ).tolist()
+    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+    prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
     prompt = prompts[0]
 
     def single_bench():
@@ -96,20 +95,23 @@ def main():
             model, tokenizer, prompts, max_tokens=generation_tokens
         ).stats
 
-    _bench = batch_bench
+    if batch_size == 1:
+        _bench = single_bench
+    else:
+        _bench = batch_bench
 
-    print("Running warmup..")
+    rprint("Running warmup..")
     _bench()
 
     report_keys = ["prompt_tps", "generation_tps", "peak_memory"]
-    print(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
+    rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
         response = _bench()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
-        print(f"Trial {i+1}:  " + ", ".join(results))
+        rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):
         vals = (getattr(response, k) for response in responses)
@@ -117,7 +119,7 @@ def main():
 
     results = [(k, avg(k)) for k in report_keys]
     results = [f"{k}={v:.3f}" for k, v in results]
-    print(f"Averages: " + ", ".join(results))
+    rprint(f"Averages: " + ", ".join(results))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import logging
 import os
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import lm_eval
 import mlx.core as mx
@@ -25,7 +25,10 @@ from tqdm import tqdm
 
 from .generate import batch_generate
 from .models.cache import make_prompt_cache
+from .sample_utils import make_sampler
 from .utils import common_prefix_len, load
+
+DEFAULT_MAX_TOKENS = 8192
 
 
 def _rstrip_until(s, untils):
@@ -34,6 +37,13 @@ def _rstrip_until(s, untils):
     f = [s.find(u) for u in untils]
     f = [l if x < 0 else x for x in f]
     return s[: min(f)]
+
+
+def _lstrip(s, pattern):
+    """Truncate the prefix of the string after the first occurrence of pattern."""
+    if (idx := s.find(pattern)) != -1:
+        return s[idx + len(pattern) :]
+    return s
 
 
 def _pad_inputs(inputs):
@@ -68,9 +78,10 @@ class MLXLM(LM):
     def __init__(
         self,
         path_or_hf_repo: str,
-        max_tokens: int,
+        max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ) -> None:
         super().__init__()
         tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
@@ -82,6 +93,7 @@ class MLXLM(LM):
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
             self.use_chat_template = self.tokenizer.chat_template is not None
+        self._sampler = sampler
 
     def _process_prompt(self, prompt, step_size: int = 2048):
         prompt = mx.array(prompt)[None]
@@ -98,28 +110,28 @@ class MLXLM(LM):
         inputs, targets = inputs[..., :-1], inputs[..., 1:]
 
         cache = cache or make_prompt_cache(self._model)
-        lengths += cache[0].offset
-
+        offset = 0
         scores, is_greedy = [], []
         for i in range(0, inputs.shape[1], step_size):
             inp = inputs[:, i : i + step_size]
             T = inp.shape[1]
 
-            offset = cache[0].offset
             logits = self._model(inp, cache=cache)
             log_probs = nn.log_softmax(logits.astype(mx.float32))
 
             score = mx.take_along_axis(
                 log_probs, targets[:, i : i + step_size, mx.newaxis], axis=-1
             )[..., 0]
+
             ig = targets[:, i : i + step_size] == mx.argmax(logits, axis=-1)
-            ig = mx.where(mx.arange(T) + offset < lengths[:, None], ig, False)
+            ig = mx.where(mx.arange(offset, T + offset) < lengths[:, None], ig, False)
 
             mx.eval(score, ig)
             mx.clear_cache()
 
             is_greedy.append(ig)
             scores.append(score)
+            offset += T
 
         scores = mx.concatenate(scores, axis=1)
         is_greedy = mx.concatenate(is_greedy, axis=1)
@@ -182,7 +194,8 @@ class MLXLM(LM):
             max_completed_l = max(len(s) for s in full_sequences)
 
             # compute truncation length
-            truncation = max(0, max_completed_l - self._max_tokens - 1)
+            max_tokens = self._max_tokens or DEFAULT_MAX_TOKENS
+            truncation = max(0, max_completed_l - max_tokens - 1)
             orig_prefix_l = len(prefix)
             prefix_l = max(len(prefix) - truncation, 0)
             prefix = prefix[len(prefix) - prefix_l :]
@@ -304,11 +317,16 @@ class MLXLM(LM):
             continuation: str
                 The generated continuation.
         """
+        group = mx.distributed.init()
+
+        # split data accross ranks
+        total_requests = len(requests)
+        requests = requests[group.rank() :: group.size()]
+
         logging.info("Generating continuation for %d sequences." % len(requests))
         contexts, options = zip(*[req.args for req in requests])
         # The second element of the tuple contains:
         # {'do_sample': False, 'until': ['\n\n'], 'temperature': 0}
-        completions = []
 
         # Tokenize all contexts
         contexts = [
@@ -319,7 +337,10 @@ class MLXLM(LM):
         ]
 
         # TODO consider multi-token, per-prompt stop conditions
-        max_tokens = [opt.get("max_gen_toks", self._max_tokens) for opt in options]
+        max_tokens = [
+            self._max_tokens or opt.get("max_gen_tokens", DEFAULT_MAX_TOKENS)
+            for opt in options
+        ]
 
         completions = batch_generate(
             model=self._model,
@@ -327,12 +348,46 @@ class MLXLM(LM):
             prompts=contexts,
             max_tokens=max_tokens,
             verbose=True,
+            sampler=self._sampler,
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
-            until = opt["until"]
-            if any(u in text for u in until):
-                completions[e] = _rstrip_until(text, until)
+            completions[e] = _rstrip_until(text, opt["until"])
+            if self.tokenizer.has_thinking:
+                completions[e] = _lstrip(text, self.tokenizer.think_end)
+
+        # Gather the completions
+        if group.size() > 1:
+            with mx.stream(mx.cpu):
+                pad_to = (total_requests + group.size() - 1) // group.size()
+                pad = pad_to - len(completions)
+                completions = [list(c.encode("utf-8")) for c in completions]
+                max_len = mx.array(max(len(c) for c in completions))
+                max_len = mx.distributed.all_max(max_len).item()
+                lengths = mx.array([len(c) for c in completions] + [0] * pad)
+                completions = mx.array(
+                    [c + [0] * (max_len - len(c)) for c in completions]
+                    + [[0] * max_len] * pad,
+                    mx.uint8,
+                )
+                completions = (
+                    mx.distributed.all_gather(completions[None])
+                    .swapaxes(0, 1)
+                    .flatten(0, 1)
+                    .tolist()
+                )
+                lengths = (
+                    mx.distributed.all_gather(lengths[None])
+                    .swapaxes(0, 1)
+                    .flatten(0, 1)
+                    .tolist()
+                )
+                completions = completions[:total_requests]
+                lengths = lengths[:total_requests]
+                completions = [
+                    bytearray(c[:l]).decode() for c, l in zip(completions, lengths)
+                ]
+
         return completions
 
 
@@ -350,8 +405,9 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        help="Maximum number of tokens to generate.",
-        default=8912,
+        help="Maximum number of tokens to generate. When set, this value takes"
+        " precedence over task specific defaults.",
+        default=None,
     )
     parser.add_argument(
         "--limit",
@@ -393,7 +449,9 @@ def main():
         action="store_true",
         help="Enable trusting remote code for tokenizer",
     )
-
+    parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
+    parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -410,11 +468,17 @@ def main():
     if world.size() > 1 and world.rank() == 0:
         print(f"Evaluating with {world.size()} nodes")
 
+    sampler = make_sampler(
+        temp=args.temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
     lm = MLXLM(
         args.model,
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
         trust_remote_code=args.trust_remote_code,
+        sampler=sampler,
     )
     MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
 

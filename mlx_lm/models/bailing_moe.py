@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -37,6 +38,7 @@ class ModelArgs(BaseModelArgs):
     use_qk_norm: bool = False
     tie_word_embeddings: bool = False
     partial_rotary_factor: float = 1.0
+    rotary_dim: Optional[int] = None
     moe_router_enable_expert_bias: bool = False
     moe_router_enable_routed_scaling: bool = True
     routed_scaling_factor: float = 1.0
@@ -45,6 +47,18 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 4
     moe_shared_expert_intermediate_size: Optional[int] = None
     moe_router_enable_shared_expert: bool = True
+
+
+@partial(mx.compile, shapeless=True)
+def swiglu(gate, up):
+    return nn.silu(gate) * up
+
+
+@partial(mx.compile, shapeless=True)
+def aggregate_expert_outputs(expert_outputs, scores):
+    return (
+        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+    )
 
 
 class BailingMoeMLP(nn.Module):
@@ -67,7 +81,7 @@ class BailingMoeMLP(nn.Module):
         )
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class BailingMoeAttention(nn.Module):
@@ -94,8 +108,10 @@ class BailingMoeAttention(nn.Module):
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
+        if (rope_dim := args.rotary_dim) is None:
+            rope_dim = int(self.head_dim * args.partial_rotary_factor)
         self.rope = initialize_rope(
-            int(self.head_dim * args.partial_rotary_factor),
+            rope_dim,
             args.rope_theta,
             traditional=False,
             scaling_config=args.rope_scaling,
@@ -146,6 +162,7 @@ class BailingMoeAttention(nn.Module):
         return self.dense(output)
 
 
+@mx.compile
 def group_expert_select(
     gates,
     e_score_correction_bias,
@@ -171,15 +188,15 @@ def group_expert_select(
         k = n_group - topk_group
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
         scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            scores, mx.stop_gradient(group_idx), mx.array(0.0, scores.dtype), axis=-2
         )
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
         scores = scores / denominator
     scores = scores * routed_scaling_factor
 
@@ -245,7 +262,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
     def __call__(self, x):
         topk_idx, topk_weight = self.gate(x)
         out = self.switch_mlp(x, topk_idx)
-        out = (out * topk_weight[..., None]).sum(axis=-2)
+        out = aggregate_expert_outputs(out, topk_weight)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out

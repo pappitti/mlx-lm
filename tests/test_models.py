@@ -10,6 +10,7 @@ from mlx.utils import tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
@@ -36,7 +37,7 @@ class TestModels(unittest.TestCase):
 
     def test_rotating_kv_cache(self):
         b, h, d = 1, 2, 32
-        cache = RotatingKVCache(max_size=8, step=4)
+        cache = RotatingKVCache(max_size=8)
 
         k = mx.random.uniform(shape=(b, h, 2, d))
         v = mx.random.uniform(shape=(b, h, 2, d))
@@ -69,7 +70,7 @@ class TestModels(unittest.TestCase):
             idx %= 8
 
         # Try with nonzero keep
-        cache = RotatingKVCache(max_size=8, step=4, keep=2)
+        cache = RotatingKVCache(max_size=8, keep=2)
 
         # Check a large update
         k = mx.random.uniform(shape=(b, h, 20, d))
@@ -97,7 +98,7 @@ class TestModels(unittest.TestCase):
         # alternating prompt/prefill with generation
         d = 4
         h = 2
-        cache = RotatingKVCache(max_size=18, step=4)
+        cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
         k, v = cache.update_and_fetch(x, x)
@@ -173,6 +174,49 @@ class TestModels(unittest.TestCase):
         expected_sums = mx.array([3, 3, 3, 3, 3])
         sums = mask.sum(axis=1)
         self.assertTrue(mx.array_equal(sums, expected_sums))
+
+    def test_llama_model_sliding_attention(self):
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        model = llama.Model(args)
+
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], KVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], RotatingKVCache)
+        self.assertIsInstance(caches[3], KVCache)
+
+        caches = model.make_cache()
+        step = model(tokens[:, :2], cache=caches)
+        mx.eval(step)
+        step = model(tokens[:, 2:3], cache=caches)
+        mx.eval(step)
+        self.assertEqual(caches[0].offset, 3)
+        self.assertEqual(caches[1].offset, 3)
 
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
@@ -299,6 +343,35 @@ class TestModels(unittest.TestCase):
             conv_L_cache=3,
         )
         model = lfm2.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_lfm2_moe(self):
+        from mlx_lm.models import lfm2_moe
+
+        args = lfm2_moe.ModelArgs(
+            model_type="lfm2_moe",
+            hidden_size=1024,
+            intermediate_size=7168,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            norm_eps=1e-5,
+            vocab_size=10_000,
+            full_attn_idxs=[0, 1, 2],
+            rope_theta=10000,
+            max_position_embeddings=1000,
+            conv_bias=True,
+            conv_L_cache=3,
+            moe_intermediate_size=1792,
+            num_dense_layers=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            use_expert_bias=True,
+        )
+        model = lfm2_moe.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -661,6 +734,19 @@ class TestModels(unittest.TestCase):
             time_step_rank=48,
         )
         model = mamba.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_falcon_h1(self):
+        from mlx_lm.models import falcon_h1
+
+        args = falcon_h1.ModelArgs(
+            model_type="falcon_h1",
+            num_hidden_layers=12,
+            vocab_size=10000,
+        )
+        model = falcon_h1.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -1650,6 +1736,50 @@ class TestModels(unittest.TestCase):
                 "vocab_size": 1000,
             },
             {
+                "model_type": "qwen3_vl_moe",
+                "text_config": {
+                    "model_type": "qwen3_moe",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "rms_norm_eps": 1e-5,
+                    "head_dim": 32,
+                    "vocab_size": 1000,
+                    "decoder_sparse_step": 1,
+                    "mlp_only_layers": [],
+                    "num_experts_per_tok": 2,
+                    "num_experts": 4,
+                    "moe_intermediate_size": 128,
+                    "rope_theta": 1000,
+                    "max_position_embeddings": 1000,
+                    "tie_word_embeddings": False,
+                    "norm_topk_prob": True,
+                },
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "qwen3_vl",
+                "text_config": {
+                    "model_type": "qwen3",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 1000,
+                    "head_dim": 32,
+                    "max_position_embeddings": 1000,
+                    "tie_word_embeddings": False,
+                    "rope_theta": 1000,
+                },
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+            },
+            {
                 "model_type": "seed_oss",
                 "hidden_size": 128,
                 "num_hidden_layers": 4,
@@ -1731,6 +1861,141 @@ class TestModels(unittest.TestCase):
                 "head_dim": 32,
                 "num_key_value_heads": 2,
             },
+            {
+                "model_type": "llama4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "head_dim": 32,
+                "num_key_value_heads": 2,
+                "intermediate_size_mlp": 128,
+                "rope_theta": 1000.0,
+                "head_dim": 8,
+                "tie_word_embeddings": False,
+                "no_rope_layers": [0, 0, 1, 1],
+                "use_qk_norm": True,
+            },
+            {
+                "model_type": "mamba2",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "state_size": 32,
+                "num_hidden_layers": 4,
+                "layer_norm_epsilon": 1e-4,
+                "conv_kernel": 3,
+                "n_groups": 4,
+                "use_bias": False,
+                "use_conv_bias": False,
+                "chunk_size": 32,
+                "tie_word_embeddings": True,
+                "time_step_limit": (0.01, 10),
+                "time_step_rank": "auto",
+            },
+            {
+                "model_type": "olmo3",
+                "num_heads": 8,
+                "head_dim": 16,
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "rope_theta": 1000,
+                "num_hidden_layers": 8,
+                "rms_norm_eps": 1e-4,
+                "sliding_window": 128,
+                "tie_word_embeddings": True,
+                "max_position_embeddings": 1000,
+            },
+            {
+                "model_type": "jamba",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "attn_layer_offset": 1,
+                "attn_layer_period": 2,
+                "expert_layer_offset": 1,
+                "expert_layer_period": 2,
+                "mamba_d_conv": 4,
+                "mamba_d_state": 128,
+                "mamba_expand": 128,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 1000,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "nanochat",
+                "hidden_size": 1280,
+                "num_hidden_layers": 20,
+                "vocab_size": 32,
+                "intermediate_size": 128,
+            },
+            {
+                "model_type": "minimax",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "max_position_embeddings": 1000,
+                "num_experts_per_tok": 2,
+                "num_local_experts": 8,
+                "shared_intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "rms_norm_eps": 1e-4,
+                "rope_theta": 1000,
+                "rotary_dim": 16,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "bailing_moe_linear",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "moe_intermediate_size": 1024,
+                "num_experts_per_tok": 2,
+                "num_experts": 4,
+                "norm_topk_prob": True,
+                "num_shared_experts": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 10_000,
+                "rope_theta": 1000,
+                "first_k_dense_replace": 0,
+                "layer_group_size": 2,
+                "group_norm_size": 1,
+                "max_position_embeddings": 1000,
+            },
+            {
+                "model_type": "kimi_linear",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "intermediate_size": 128,
+                "head_dim": 32,
+                "rope_theta": 100.0,
+                "rms_norm_eps": 1e-6,
+                "linear_attn_config": {
+                    "num_heads": 8,
+                    "head_dim": 32,
+                    "kda_layers": [1],
+                },
+                "model_max_length": 1000,
+                "num_experts": 2,
+                "moe_intermediate_size": 128,
+                "kv_lora_rank": 8,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -1810,6 +2075,58 @@ class TestModels(unittest.TestCase):
         out_m = out_m[:, pad:]
         self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
+
+    def test_gated_delta(self):
+        mx.random.seed(0)
+        for B in [1, 2]:
+            for T in [1, 2]:
+                Hk = 16
+                Hv = 32
+                Dk = 128
+                Dv = 128
+
+                q = mx.random.normal(shape=(B, T, Hk, Dk))
+                k = mx.random.normal(shape=(B, T, Hk, Dk))
+                v = mx.random.normal(shape=(B, T, Hv, Dv))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
+                state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+                y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_masked(self):
+        B = 1
+        T = 3
+        Hk = 16
+        Hv = 32
+        Dk = 128
+        Dv = 128
+
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        g = mx.random.normal(shape=(B, T, Hv))
+        mask = mx.array([[False, True, True]])
+        beta = mx.random.normal(shape=(B, T, Hv))
+        state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+        y_gt, st_gt = gated_delta_ops(
+            q[:, 1:],
+            k[:, 1:],
+            v[:, 1:],
+            g[:, 1:],
+            beta[:, 1:],
+            state,
+        )
+        for fn in [gated_delta_ops, gated_delta_kernel]:
+            y, st = fn(q, k, v, g, beta, state, mask)
+            y = y[:, 1:]
+            self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

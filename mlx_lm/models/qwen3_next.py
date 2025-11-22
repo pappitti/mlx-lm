@@ -1,14 +1,21 @@
 # Copyright © 2025 Apple Inc.
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, MambaCache
+from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -43,52 +50,6 @@ class ModelArgs(BaseModelArgs):
     head_dim: Optional[int] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
-
-
-@partial(mx.compile, shapeless=True)
-def compute_g(A_log, a, dt_bias):
-    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
-        A_log.dtype
-    )
-
-
-def recurrent_gated_delta_rule(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
-    a: mx.array,
-    b: mx.array,
-    A_log: mx.array,
-    dt_bias: mx.array,
-    state: mx.array,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[mx.array, mx.array]:
-    B, S, Hk, Dk = key.shape
-    Hv, Dv = value.shape[2:]
-    inv_scale = Dk**-0.5
-
-    if use_qk_l2norm_in_kernel:
-        query = (inv_scale**2) * mx.fast.rms_norm(query, None, 1e-6)
-        key = inv_scale * mx.fast.rms_norm(key, None, 1e-6)
-    else:
-        query = inv_scale * query
-
-    input_type = query.dtype
-    if (repeat_factor := Hv // Hk) > 1:
-        query = mx.repeat(query, repeat_factor, 2)
-        key = mx.repeat(key, repeat_factor, 2)
-
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
-
-    out = mx.zeros((B, S, Hv, Dv), dtype=input_type)
-    for i in range(S):
-        state *= g[:, i, :, None, None]
-        kv_mem = (state * key[:, i, :, :, None]).sum(axis=-2)
-        delta = (value[:, i] - kv_mem) * beta[:, i, :, None]
-        state += key[:, i, :, :, None] * delta[..., None, :]
-        out[:, i] = (state * query[:, i, :, :, None]).sum(axis=-2)
-    return out, state
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -283,6 +244,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         mixed_qkv = mx.concatenate(
             [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)], axis=-1
         )
+        if mask is not None:
+            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
@@ -297,15 +260,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         ]
 
-        if cache is not None and cache[1] is not None:
-            state = cache[1]
-        else:
-            state = mx.zeros(
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                dtype=inputs.dtype,
-            )
+        state = cache[1] if cache else None
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = recurrent_gated_delta_rule(
+        out, state = gated_delta_update(
             q,
             k,
             v,
@@ -314,7 +274,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.A_log,
             self.dt_bias,
             state,
-            use_qk_l2norm_in_kernel=True,
+            mask,
+            use_kernel=not self.training,
         )
 
         if cache is not None:
@@ -407,6 +368,7 @@ class Qwen3NextModel(nn.Module):
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
@@ -419,9 +381,11 @@ class Qwen3NextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
         for layer, c in zip(self.layers, cache):
+            mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)

@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import resource
 import shutil
 from pathlib import Path
 from textwrap import dedent
@@ -14,6 +15,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Optional,
     Tuple,
     Type,
@@ -31,17 +33,19 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_map, tree_reduce
-from transformers import PreTrainedTokenizer
+# For large models with lots of files
+resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
+
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import get_total_parameters, load_adapters
+from .tokenizer_utils import TokenizerWrapper
+from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
     "mistral": "llama",
+    "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "kimi_k2": "deepseek_v3",
@@ -73,6 +77,20 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
+def get_total_parameters(model):
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
+
+
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -81,9 +99,11 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None
-) -> Tuple[Path, Optional[str]]:
+def _download(
+    path_or_hf_repo: str,
+    revision: Optional[str] = None,
+    allow_patterns: List[str] = None,
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -93,39 +113,35 @@ def get_model_path(
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
-        Tuple[Path, str]: A tuple containing the local file path and the Hugging Face repo ID.
+        Path: The local file path.
     """
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        hf_path = path_or_hf_repo
+        allow_patterns = allow_patterns or [
+            "*.json",
+            "model*.safetensors",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ]
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
                 revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "model*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "tiktoken.model",
-                    "*.txt",
-                    "*.jsonl",
-                    "*.jinja",
-                ],
+                allow_patterns=allow_patterns,
             )
         )
-    else:
-        from huggingface_hub import ModelCard
 
-        card_path = model_path / "README.md"
-        if card_path.is_file():
-            card = ModelCard.load(card_path)
-            hf_path = card.data.base_model
-        else:
-            hf_path = None
-    return model_path, hf_path
+    return model_path
+
+
+def hf_repo_to_path(hf_repo):
+    return Path(snapshot_download(hf_repo, local_files_only=True))
 
 
 def load_config(model_path: Path) -> dict:
@@ -142,7 +158,7 @@ def load_model(
     model_path: Path,
     lazy: bool = False,
     strict: bool = True,
-    model_config: dict = {},
+    model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -169,7 +185,8 @@ def load_model(
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path)
-    config.update(model_config)
+    if model_config is not None:
+        config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -221,6 +238,11 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "compressed-tensors":
+            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -231,13 +253,46 @@ def load_model(
     return model, config
 
 
+def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
+    from .tuner.utils import load_adapters as _load_adapters
+
+    return _load_adapters(model, adapter_path)
+
+
+def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
+    """Load a huggingface tokenizer and try to infer the type of streaming
+    detokenizer to use.
+    """
+    model_path = _download(
+        model_path,
+        allow_patterns=[
+            "*.json",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ],
+    )
+    return _load_tokenizer(
+        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+    )
+
+
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
-) -> Tuple[nn.Module, TokenizerWrapper]:
+    return_config: bool = False,
+    revision: Optional[str] = None,
+) -> Union[
+    Tuple[nn.Module, TokenizerWrapper],
+    Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
+]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -252,16 +307,19 @@ def load(
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        return_config (bool: If ``True`` return the model config as the last item..
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
     Returns:
-        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
+        Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
+            A tuple containing the loaded model, tokenizer and, if requested, the model config.
 
     Raises:
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path, _ = get_model_path(path_or_hf_repo)
+    model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy)
+    model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -269,19 +327,66 @@ def load(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
 
-    return model, tokenizer
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
 
 
-def fetch_from_hub(
-    model_path: Path, lazy: bool = False, trust_remote_code: bool = False
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model, config = load_model(model_path, lazy)
+def pipeline_load(repo, return_config=False):
+    # Get model path with everything but weight safetensors
+    model_path = _download(
+        repo,
+        allow_patterns=[
+            "*.json",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ],
+    )
+
+    # Lazy load and shard model to figure out which weights we need
+    model, config = load_model(model_path, lazy=True, strict=False)
+
+    group = mx.distributed.init()
+    rank = group.rank()
+    model.model.pipeline(group)
+
+    # Figure out which files we need for the local shard
+    with open(model_path / "model.safetensors.index.json", "r") as fid:
+        weight_index = json.load(fid)["weight_map"]
+
+    local_files = set()
+    for k, _ in tree_flatten(model.parameters()):
+        if file_name := weight_index.get(k, None) is None:
+            raise ValueError(
+                "Pipeline loading is only supported for MLX converted models."
+            )
+        local_files.add(weight_index[k])
+
+    # Download weights for local shard
+    _download(repo, allow_patterns=local_files)
+
+    # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
+        {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
-        tokenizer_config_extra={"trust_remote_code": trust_remote_code},
     )
-    return model, config, tokenizer
+    model, _ = load_model(model_path, lazy=True, strict=False)
+    model.model.pipeline(group)
+    mx.eval(model.parameters())
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -308,24 +413,28 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path, None]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (Union[str, Path]): Local path to the model.
-        hf_path (Union[str, Path]): Path to the original Hugging Face model.
+        hf_path (Union[str, Path, None]): Path to the original Hugging Face model.
     """
-    from huggingface_hub import ModelCard
+    from huggingface_hub import ModelCard, ModelCardData
 
-    card = ModelCard.load(hf_path)
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
     card.data.pipeline_tag = "text-generation"
     if card.data.tags is None:
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = str(hf_path)
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
     card.text = ""
     card.save(os.path.join(path, "README.md"))
 
@@ -345,15 +454,22 @@ def upload_to_hub(path: str, upload_repo: str):
     logging.set_verbosity_info()
     card_path = Path(path) / "README.md"
     card = ModelCard.load(card_path)
-    hf_path = card.data.base_model
-    card.text = dedent(
-        f"""
-        # {upload_repo}
 
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
         This model [{upload_repo}](https://huggingface.co/{upload_repo}) was
         converted to MLX format from [{hf_path}](https://huggingface.co/{hf_path})
         using mlx-lm version **{__version__}**.
+        """
+    else:
+        provenance = ""
 
+    card.text = dedent(
+        f"""
+        # {upload_repo}
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -455,9 +571,7 @@ def quantize_model(
     group_size: int,
     bits: int,
     mode: str = "affine",
-    quant_predicate: Optional[
-        Callable[[str, nn.Module, dict], Union[bool, dict]]
-    ] = None,
+    quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
@@ -468,11 +582,10 @@ def quantize_model(
         group_size (int): Group size for quantization.
         bits (int): Bits per weight for quantization.
         mode (str): The quantization mode.
-        quant_predicate (Callable): A callable that decides how
-            to quantize each layer based on the path.
-            Accepts the layer `path`, the `module` and the model `config`.
-            Returns either a bool to signify quantize/no quantize or
-            a dict of quantization parameters to pass to `to_quantized`.
+        quant_predicate (Callable): A callable that decides how to quantize
+          each layer based on the path. Accepts the layer `path` and the
+          `module`. Returns either a bool to signify quantize/no quantize or
+          a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
@@ -519,6 +632,52 @@ def quantize_model(
     return model, quantized_config
 
 
+def dequantize_model(model: nn.Module) -> nn.Module:
+    """
+    Dequantize the quantized layers in the model.
+
+    Args:
+        model (nn.Module): The model with quantized layers.
+
+    Returns:
+        nn.Module: The model with dequantized layers.
+    """
+    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+
+    dequantize_layers = []
+    for name, module in model.named_modules():
+        bias = "bias" in module
+        if isinstance(module, nn.QuantizedLinear):
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+            module.mode,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
+
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
+    return model
+
+
 def save_config(
     config: dict,
     config_path: Union[str, Path],
@@ -547,14 +706,20 @@ def save_config(
 
 def save(
     dst_path: Union[str, Path],
-    src_path: Union[str, Path],
+    src_path_or_repo: Union[str, Path],
     model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
-    hf_repo: Optional[str] = None,
     donate_model: bool = True,
 ):
-    src_path = Path(src_path)
+
+    src_path = Path(src_path_or_repo)
+    if not src_path.exists():
+        hf_repo = src_path_or_repo
+        src_path = hf_repo_to_path(hf_repo)
+    else:
+        hf_repo = None
+
     dst_path = Path(dst_path)
     save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
@@ -564,8 +729,7 @@ def save(
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
-    if hf_repo is not None:
-        create_model_card(dst_path, hf_repo)
+    create_model_card(dst_path, hf_repo)
 
 
 def common_prefix_len(list1, list2):
